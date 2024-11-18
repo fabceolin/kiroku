@@ -48,6 +48,14 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 2. Installation of PANDOC
+
+You need to install PANDOC. As pointed out by Charles Ferreira Gonçalves, in macos, you can do it by executing the following command.
+
+```shell
+brew instal pandoc
+```
+
 # The Initial Configuration
 
 The initial configuration is specified in an YAML file with the following fields:
@@ -159,7 +167,7 @@ temperature: 0.1
 
 There is a script `check_yaml` that checks if the YAML file is consistent and it will not crash Kiroku.
 
-I recommend putting all YAML files right now in the `kikoku/proj` direcotry. All images should be in `kiroku/proj/images`. 
+I recommend putting all YAML files right now in the `kikoku/proj` directory. All images should be in `kiroku/proj/images`. 
 
 Because of a limitation of Gradio, you need to specify images as `'/file=images/<your-image-file>'` such as in the example `/file=images/multi-agent.jpeg`.
 

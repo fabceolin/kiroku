@@ -3,7 +3,7 @@
 import json
 import re
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, AIMessage, ChatMessage
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from typing import TypedDict, List, Set
 
 from .gen_citations import insert_references
@@ -22,11 +22,6 @@ from .prompts import (
 )
 from .search import *
 
-
-class Queries(BaseModel):
-    queries: List[str] = Field("Plain list of string queries")
-
-
 class AgentState(TypedDict):
     state: str
 
@@ -38,19 +33,19 @@ class AgentState(TypedDict):
     section_names: str
     number_of_paragraphs: str
     results: str
-    references: List[str]
+    references: list[str]
 
     # these are instructions that we save for the topic sentences
     # and paper writing
-    review_topic_sentences: List[str]
-    review_instructions: List[str]
+    review_topic_sentences: list[str]
+    review_instructions: list[str]
 
     task: str
     plan: str
     draft: str
     critique: str
-    cache: Set[str]
-    content: List[str]
+    cache: set[str]
+    content: list[str]
     revision_number: int
     number_of_queries: int
     max_revisions: int
@@ -225,7 +220,7 @@ class InternetSearch(State):
                             INTERNET_SEARCH_PROMPT.format(
                                 number_of_queries=state['number_of_queries']) +
                             " You must only output the response in a plain list of queries "
-                            "in the format '" + Queries().json() + "' and no other text. "
+                            "in the JSON format '{ \"queries\": list[str] }' and no other text. "
                             "You MUST only cite references that are in the references "
                             "section. "
                     )),
@@ -236,7 +231,7 @@ class InternetSearch(State):
             if result[:7] == "```json":
                 result = result.split('\n')
                 result = '\n'.join(result[1:-1])
-            content = state['content'] or []
+            content = state.get('content', [])
             try:
                 queries = json.loads(result)
                 break
@@ -369,8 +364,8 @@ class PaperWriter(State):
         :param state: current state of the agent.
         :return: field 'draft' and 'revision_number' added to the paper.
         '''
-        content = "\n\n".join(state['content'] or [])
-        critique = state['critique'] or ""
+        content = "\n\n".join(state.get('content', []))
+        critique = state.get('critique', '')
         review_instructions = state.get("review_instructions", [])
         task = state["task"]
         sentences_per_paragraph = state["sentences_per_paragraph"]
@@ -521,8 +516,8 @@ class ReflectionCritiqueReviewer(State):
             SystemMessage(
                 content=(
                         RESEARCH_CRITIQUE_PROMPT +
-                        " You must only output the response " +
-                        "'" + Queries().json() + "' and no other text."
+                        " You must only output the response in the" +
+                        "JSON format '{ \"queries\": list[str] }' and no other text."
                 )),
             HumanMessage(content=state['critique'])
         ]).content
@@ -535,7 +530,7 @@ class ReflectionCritiqueReviewer(State):
             queries = json.loads(result)
         except:
             logging.warning(f"state {self.name}: could not extract query {result}.")
-        content = state['content'] or []
+        content = state.get('content', [])
         if queries["queries"]:
             search, cache = search_query_ideas(
                 query_ideas=queries, cache=state.get("cache", set()))
