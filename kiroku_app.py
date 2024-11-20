@@ -2,7 +2,7 @@
 
 from agents.states import *
 from copy import deepcopy
-import gradio as gr
+import streamlit as st
 from IPython.display import display, Image
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -21,6 +21,27 @@ except ImportError:
     from yaml import Loader
 
 logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger()
+
+st.set_page_config(page_title="Kiroku Document Writing App", layout="wide")
+
+# Initialize session state variables
+if 'kiroku_initialized' not in st.session_state:
+    st.session_state.kiroku_initialized = False
+    st.session_state.writer = None
+    st.session_state.state_values = {}
+    st.session_state.references = []
+    st.session_state.next_state = -1
+    st.session_state.filename = ""
+    st.session_state.images = ""
+    st.session_state.cache = set()
+    st.session_state.draft = ""
+    st.session_state.atlas_message = ""
+    st.session_state.current_state = ""
+    st.session_state.messages = []
+    st.session_state.instruction = ""
+
+
 class DocumentWriter:
     def __init__(
             self,
@@ -269,90 +290,216 @@ class DocumentWriter:
 class KirokuUI:
     def __init__(self, working_dir):
         self.working_dir = working_dir
-        self.first = True
-        self.next_state = -1
-        self.references = []
+        self.images_dir = os.path.join(self.working_dir, "images")
+        self.filename = ""
 
-    def read_initial_state(self, filename):
+        # Ensure images directory exists
+        os.makedirs(self.images_dir, exist_ok=True)
+
+    def read_initial_state(self, filepath):
         '''
-        Reads initial state from a YAML 'filename'.
-        :param filename: YAML file containing initial paper configuration.
-        :return: initial state dictionary.
+        Reads initial state from a YAML file and initializes missing keys.
         '''
-        stream = open(filename, 'r')
         try:
-            state = yaml.load(stream, Loader=Loader)
-        except yaml.parser.ParserError:
-            logging.error("Cannot load YAML file")
+            with open(filepath, 'r') as file:
+                state = yaml.load(file, Loader=yaml.Loader)
+        except Exception as e:
+            logger.error(f"Cannot load YAML file: {e}")
+            st.error(f"Error loading YAML file: {e}")
             return {}
-        if not "sentences_per_paragraph" in state:
-            state["sentences_per_paragraph"] = 4
-        self.suggest_title = state.pop("suggest_title", False)
-        self.generate_citations = state.pop("generate_citations", False)
-        self.model_name = state.pop("model_name", "openai++")
-        self.temperature = state.pop("temperature", 0.0)
+
+        # Ensure all required keys are initialized
+        state.setdefault("sentences_per_paragraph", 4)
+        state.setdefault("messages", [])  # Initialize messages as an empty list
+        state.setdefault("review_topic_sentences", [])
+        state.setdefault("review_instructions", [])
+        state.setdefault("content", [])
+        state.setdefault("references", [])
+        state.setdefault("cache", set())
+        state.setdefault("revision_number", 1)
+
+        # Extract and remove optional configurations
+        st.session_state.suggest_title = state.pop("suggest_title", False)
+        st.session_state.generate_citations = state.pop("generate_citations", False)
+        st.session_state.model_name = state.pop("model_name", "openai++")
+        st.session_state.temperature = state.pop("temperature", 0.0)
+
+        # Combine hypothesis and instructions
         state["hypothesis"] = (
-                state["hypothesis"] + "\n\n" + state.pop("instructions", "")
+            state.get("hypothesis", "") + "\n\n" + state.pop("instructions", "")
         )
         return state
 
-    def step(self, instruction, state_values=None):
-        """
-        Performs one step of the graph invocation, stopping at the next break point.
-        :param instruction: instruction to execute.
-        :param state_values: initial state values or None if continuing.
-        :return: draft of the paper.
-        """
-        config = { "instruction": instruction }
-        draft = self.writer.invoke(state_values, config)
-        return draft
-
-    def update(self, instruction):
-        """
-        Updates state upon submitting an instruction or updating references.
-        :param instruction: instruction to be executed.
-        :return: new draft, atlas message and making input object non-interactive.
-        """
-        draft = self.step(instruction)
-        state = self.writer.get_state()
-        current_state = state.values["state"]
+    def process_file(self, uploaded_file):
+        '''
+        Processes the uploaded YAML configuration file.
+        '''
         try:
-            next_state = state.next[0]
-        except:
-            next_state = "NONE"
+            # Save uploaded file to working directory
+            filepath = os.path.join(self.working_dir, uploaded_file.name)
+            with open(filepath, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            self.filename = filepath
+            st.session_state.filename = self.filename
+            logger.warning(f"Processing file: {self.filename}")
 
-        # if state is in reflection stage, draft to be shown is in the critique field.
-        if (
-                current_state == "reflection_reviewer" and
-                next_state == "additional_reflection_instructions"
-        ):
-            draft = state.values["critique"]
+            # Read initial state
+            state_values = self.read_initial_state(self.filename)
+            if not state_values:
+                st.error("Failed to read the YAML configuration.")
+                return
 
-        # if next state is going to generate citations, we populate the references
-        # for the Tab References.
-        if next_state == "generate_citations":
-            self.references = state.values.get("references", []).split('\n')
+            st.session_state.state_values = state_values
 
-        # if we have reached the end, we will save everything.
-        if next_state == END or next_state == "NONE":
-            dir = os.path.splitext(self.filename)[0]
-            logging.warning(f"saving final draft in {dir}")
-            self.save_as()
+            # Initialize DocumentWriter
+            st.session_state.writer = DocumentWriter(
+                suggest_title=st.session_state.suggest_title,
+                generate_citations=st.session_state.generate_citations,
+                model_name=st.session_state.model_name,
+                temperature=st.session_state.temperature
+            )
+            st.session_state.writer.set_thread_id(1)  # Set thread ID if needed
+            st.session_state.kiroku_initialized = True
+            st.success("YAML configuration loaded successfully.")
 
-        self.next_state = next_state
-        return (
-            draft,
-            self.atlas_message(next_state),
-            gr.update(interactive=False)
-        )
+            # Initialize references and cache
+            st.session_state.references = []
+            st.session_state.cache = set()
+            st.session_state.draft = ""
+            st.session_state.atlas_message = ""
+            st.session_state.current_state = ""
+            st.session_state.messages = []
+            st.session_state.instruction = ""
 
-    def atlas_message(self, state):
-        """
-        Returns the Echo message for a given state.
-        :param state: Next state of the multi-agent system.
-        :return:
-        """
-        message = {
+            # Start the initial step
+            self.initial_step()
+
+        except Exception as e:
+            logger.error(f"Error processing file: {e}")
+            st.error(f"Error processing file: {e}")
+
+    def initial_step(self):
+        '''
+        Performs the initial step of the document generation.
+        '''
+        try:
+            # Invoke the writer with the initial state
+            draft = st.session_state.writer.invoke(st.session_state.state_values, {})
+            st.session_state.draft = draft
+            state = st.session_state.writer.get_state()
+            st.session_state.current_state = state.values["state"]
+            try:
+                st.session_state.next_state = state.next[0]
+            except:
+                st.session_state.next_state = "NONE"
+
+            # Generate atlas message
+            st.session_state.atlas_message = self.atlas_message(st.session_state.next_state)
+
+        except Exception as e:
+            logger.error(f"Error in initial step: {e}")
+            st.error(f"Error in initial step: {e}")
+
+    def save_as(self):
+        '''
+        Saves the project in various formats.
+        '''
+        try:
+            filename = st.session_state.filename
+            state = st.session_state.writer.get_state()
+
+            draft = state.values.get("draft", "").strip()
+            draft = re.sub(r'\/?file=', '', draft)
+            plan = state.values.get("plan", "")
+            review_topic_sentences = "\n\n".join(state.values.get("review_topic_sentences", []))
+            review_instructions = "\n\n".join(state.values.get("review_instructions", []))
+            content = "\n\n".join(state.values.get("content", []))
+
+            dir_name = os.path.splitext(filename)[0]
+            dir_path = dir_name  # Save in the same directory
+            try:
+                shutil.rmtree(dir_path)
+            except FileNotFoundError:
+                pass
+            os.makedirs(dir_path, exist_ok=True)
+
+            # Symlink images
+            images_dest = os.path.join(dir_path, "images")
+            try:
+                os.symlink(self.images_dir, images_dest)
+            except FileExistsError:
+                pass
+
+            base_filename = os.path.join(dir_path, os.path.basename(dir_name))
+
+            # Save Markdown
+            with open(f"{base_filename}.md", "w", encoding='utf-8') as fp:
+                fp.write(draft)
+            logger.warning(f"Saved file {base_filename}.md")
+
+            # Save HTML
+            html = markdown.markdown(draft)
+            with open(f"{base_filename}.html", "w", encoding='utf-8') as fp:
+                fp.write(html)
+
+            # Convert to DOCX using Pandoc
+            try:
+                subprocess.run(
+                    [
+                        "pandoc",
+                        "-s", f"{base_filename}.html",
+                        "-f", "html",
+                        "-t", "docx",
+                        "-o", f"{base_filename}.docx"
+                    ],
+                    check=True
+                )
+                logger.warning(f"Saved file {base_filename}.docx")
+            except subprocess.CalledProcessError:
+                logger.error("Failed to convert HTML to DOCX. Ensure Pandoc is installed.")
+                st.error("Failed to convert HTML to DOCX. Ensure Pandoc is installed.")
+
+            # Save additional files
+            with open(f"{base_filename}_ts.txt", "w", encoding='utf-8') as fp:
+                fp.write(review_topic_sentences)
+            with open(f"{base_filename}_wi.txt", "w", encoding='utf-8') as fp:
+                fp.write(review_instructions)
+            with open(f"{base_filename}_plan.md", "w", encoding='utf-8') as fp:
+                fp.write(plan)
+            with open(f"{base_filename}_content.txt", "w", encoding='utf-8') as fp:
+                fp.write(content)
+
+            st.success(f"Project saved successfully in {dir_path}")
+
+        except Exception as e:
+            logger.error(f"Error saving project: {e}")
+            st.error(f"Error saving project: {e}")
+
+    def update_refs(self, selected_refs):
+        '''
+        Updates the references based on user selection.
+        '''
+        try:
+            state = st.session_state.writer.get_state()
+            references = selected_refs
+            logger.warning("Keeping the following references")
+            for ref in references:
+                logger.warning(ref)
+            state.values["references"] = '\n'.join(references)
+            st.session_state.writer.update_state(state)
+            st.session_state.references = references
+            st.success("References updated successfully.")
+            # Proceed to the next step after updating references
+            self.update_instruction("")
+        except Exception as e:
+            logger.error(f"Error updating references: {e}")
+            st.error(f"Error updating references: {e}")
+
+    def atlas_message(self, state_name):
+        '''
+        Generates atlas messages based on the current state.
+        '''
+        messages = {
             "suggest_title_review":
                 "Please suggest review instructions for the title.",
             "topic_sentence_manual_review":
@@ -365,225 +512,131 @@ class KirokuUI:
                 "Please look at the references tab and confirm the references."
         }
 
-        instruction = message.get(state, "")
-        if instruction or state == "generate_citations":
-            if state == "generate_citations":
+        instruction = messages.get(state_name, "")
+        if instruction or state_name == "generate_citations":
+            if state_name == "generate_citations":
                 return instruction
             else:
-                return instruction + " Type <RETURN> when done."
+                return instruction + " Type ENTER when done."
         else:
             return "We have reached the end."
 
-    def initial_step(self):
-        """
-        Performs initial step, in which we need to providate a staet to the graph.
-        :return: draft and Echo message.
-        """
-        state_values = deepcopy(self.state_values)
-        if self.suggest_title:
-            state_values["state"] = "suggest_title"
-        else:
-            state_values["state"] = "topic_sentence_writer"
-        # initialize a bunch of variables users should not care about.
-        # in principle this could be initialized in the Pydantic object,
-        # but I could not make this work there.
-        state_values["references"] = state_values.get("references", [])
-        state_values["draft"] = ""
-        state_values["revision_number"] = 1
-        state_values["messages"] = []
-        state_values["review_instructions"] = []
-        state_values["review_topic_sentences"] = []
-        draft = self.step("", state_values)
-        state = self.writer.get_state()
-        current_state = state.values["state"]
-        try:
-            next_state = state.next[0]
-        except:
-            next_state = "NONE"
-        return draft, self.atlas_message(next_state)
-
-    def process_file(self, filename):
-        """
-        Processes file uploaded.
-        :param filename: file name where to read the file.
-        :return: State that was read and make input non-interactive.
-        """
-        pwd = os.getcwd()
-        logging.warning(f"Setting working directory to {pwd}")
-        self.filename = pwd + "/" + filename.split('/')[-1]
-        self.state_values = self.read_initial_state(filename)
-        if self.state_values:
-            self.writer = DocumentWriter(
-                suggest_title=self.suggest_title,
-                generate_citations=self.generate_citations,
-                model_name=self.model_name,
-                temperature=self.temperature)
-        return self.state_values, gr.update(interactive=False)
-
-    def save_as(self):
-        """
-        Saves project status. We save all instructions given by the user.
-        :return: message where the project was saved.
-        """
-        filename = self.filename
-        state = self.writer.get_state()
-
-        draft = state.values.get("draft", "")
-        # need to replace file= by empty because of gradio problem in Markdown
-        draft = re.sub(r'\/?file=', '', draft)
-        plan = state.values.get("plan", "")
-        review_topic_sentences = "\n\n".join(state.values.get("review_topic_sentences", []))
-        review_instructions = "\n\n".join(state.values.get("review_instructions", []))
-        content = "\n\n".join(state.values.get("content", []))
-
-        dir = os.path.splitext(filename)[0]
-        try:
-            shutil.rmtree(dir)
-        except:
-            pass
-        os.mkdir(dir)
-        os.symlink(self.images, dir + "/images")
-        base_filename = dir + "/" + dir.split("/")[-1]
-        with open(base_filename + ".md", "w") as fp:
-            fp.write(draft)
-            logging.warning(f"saved file {base_filename + '.md'}")
-
-        html = markdown.markdown(draft)
-        with open(base_filename + ".html", "w") as fp:
-            fp.write(html)
-
-        try:
-            # Use pandoc to convert to docx
-            subprocess.run(
-                [
-                    "pandoc",
-                    "-s", f"{base_filename + '.html'}",
-                    "-f", "html",
-                    "-t", "docx",
-                    "-o", f"{base_filename + '.docx'}"
-                ])
-        except:
-            logging.error("cannot find 'pandoc'")
-
-        #with open(base_filename + ".docx", "wb") as fp:
-        #    buf = html2docx(html, title=state.values.get("title", ""))
-        #    fp.write(buf.getvalue())
-        logging.warning(f"saved file {base_filename + '.docx'}")
-
-        with open(base_filename + "_ts.txt", "w") as fp:
-            fp.write(review_topic_sentences)
-            logging.warning(f"saved file {base_filename + '_ts.txt'}")
-
-        with open(base_filename + "_wi.txt", "w") as fp:
-            fp.write(review_instructions)
-            logging.warning(f"saved file {base_filename + '_wi.txt'}")
-
-        with open(base_filename + "_plan.md", "w") as fp:
-            fp.write(plan)
-            logging.warning(f"saved file {base_filename + '_plan.md'}")
-
-        with open(base_filename + "_content.txt", "w") as fp:
-            fp.write(content)
-            logging.warning(f"saved file {base_filename + '_content.txt'}")
-
-        return f"Saved project {dir}"
-
-    def update_refs(self):
-        """
-        Updates the reference for Gradio
-        :return: list of gr.update objects.
-        """
-        ref_list = [gr.update() for _ in range(1000)]
-        for i in range(len(self.references)):
-            ref_list[i] = gr.update(
-                value=True,
-                visible=True,
-                label=self.references[i])
-        return [gr.update(
-            visible=self.generate_citations and len(self.references) > 0)
-        ] + ref_list
-
-    def submit_ref_list(self, *ref_list):
-        """
-        Invokes step of generating citations with user reference feedback.
-        :param ref_list: List of references that were unselected.
-        :return: Everything returned by self.update.
-        """
-        ref_list = ref_list[:len(self.references)]
-        state = self.writer.get_state()
-        references = [self.references[i] for i in range(len(self.references)) if ref_list[i]]
-        logging.warning("Keeping the following references")
-        for ref in references:
-            logging.warning(ref)
-        state.values["references"] = '\n'.join(references)
-        self.writer.update_state(state)
-        return self.update("")
-
     def create_ui(self):
-        with gr.Blocks(
-                theme=gr.themes.Default(),
-                fill_height=True) as self.kiroku_agent:
-            with gr.Tab("Initial Instructions"):
-                with gr.Row():
-                    file = gr.File(file_types=[".yaml"], scale=1)
-                    js = gr.JSON(scale=5)
-            with gr.Tab("Document Writing"):
-                out = gr.Textbox(label="Echo")
-                inp = gr.Textbox(
-                    placeholder="Instruction",
-                    label="Rider")
-                markdown = gr.Markdown("")
-                doc = gr.Button("Save")
-            with gr.Tab("References") as self.ref_block:
-                ref_list = [
-                    gr.Checkbox(
-                        value=False,
-                        visible=False,
-                        label=False,
-                        interactive=True)
-                    for _ in range(1000)
-                ]
-                submit_ref_list = gr.Button("Submit", visible=False)
+        '''
+        Renders the Streamlit UI components.
+        '''
+        tabs = st.tabs(["Initial Instructions", "Document Writing", "References"])
 
-            inp.submit(
-                self.update, inp, [markdown, out, inp]).then(
-                lambda : gr.update(
-                    value="",
-                    interactive=self.next_state not in [
-                        END, "generate_citations", "NONE"]), [], inp
-            ).then(self.update_refs, [], [submit_ref_list] + ref_list)
-            file.upload(self.process_file, file, [js, inp]).then(
-                self.initial_step, [], [markdown, out]).then(
-                lambda : gr.update(placeholder="", interactive=True), [], inp)
-            doc.click(self.save_as, [], out)
-            submit_ref_list.click(
-                self.submit_ref_list,
-                ref_list,
-                [markdown, out, submit_ref_list])
+        # Tab 1: Initial Instructions
+        with tabs[0]:
+            st.header("Initial Instructions")
+            uploaded_file = st.file_uploader("Upload YAML Configuration", type=["yaml"])
+            if uploaded_file:
+                self.process_file(uploaded_file)
 
-    def launch_ui(self):
-        logging.warning(f"... using KIROKU_PROJECT_DIRECTORY working directory of {self.working_dir}")
+            if st.session_state.kiroku_initialized:
+                st.subheader("Initial State")
+                st.json(st.session_state.state_values)
+
+        # Tab 2: Document Writing
+        with tabs[1]:
+            st.header("Document Writing")
+            if not st.session_state.kiroku_initialized:
+                st.warning("Please upload the YAML configuration in the 'Initial Instructions' tab.")
+                return
+
+            # Display the current draft
+            st.text_area("Echo", value=st.session_state.draft, height=300, key="echo_box")
+
+            # Display atlas message
+            if st.session_state.atlas_message:
+                st.markdown(f"**System Message:** {st.session_state.atlas_message}")
+
+            # Input for instructions
+            instruction = st.text_input("Instruction", placeholder="Enter your instruction here...", key="instruction_input")
+
+            # Submit Instruction Button
+            if st.button("Submit Instruction"):
+                if instruction.strip() == "" and st.session_state.next_state not in ["generate_citations", "NONE", END]:
+                    st.warning("Please enter a valid instruction.")
+                else:
+                    self.update_instruction(instruction)
+
+            # Save button functionality
+            if st.button("Save"):
+                self.save_as()
+
+        # Tab 3: References
+        with tabs[2]:
+            st.header("References")
+            if not st.session_state.kiroku_initialized:
+                st.warning("Please upload the YAML configuration in the 'Initial Instructions' tab.")
+                return
+
+            if st.session_state.generate_citations and st.session_state.references:
+                st.subheader("Select References to Keep")
+                # Use multiselect for better performance and usability
+                selected_refs = st.multiselect(
+                    "Select references to keep:",
+                    options=st.session_state.references,
+                    default=st.session_state.references
+                )
+
+                if st.button("Submit References"):
+                    self.update_refs(selected_refs)
+            else:
+                st.info("No references to display.")
+
+    def update_instruction(self, instruction):
+        '''
+        Handles the instruction submission.
+        '''
         try:
-            os.chdir(self.working_dir)
-        except:
-            logging.warning(f"... directory {self.working_dir} does not exist")
-            os.mkdir(self.working_dir)
-        self.images = self.working_dir + "/images"
-        logging.warning(
-            f"... using directory {self.working_dir}/images to store images")
-        try:
-            os.mkdir(self.images)
-        except:
-            pass
-        self.kiroku_agent.launch(server_name='localhost') #allowed_paths=[working_dir])
+            # Update instruction in session state
+            st.session_state.instruction = instruction
+
+            with st.spinner('Processing...'):
+                # Invoke the writer's update method
+                draft = st.session_state.writer.invoke(st.session_state.state_values, {"instruction": instruction})
+                st.session_state.draft = draft
+                state = st.session_state.writer.get_state()
+                st.session_state.current_state = state.values["state"]
+                try:
+                    st.session_state.next_state = state.next[0]
+                except:
+                    st.session_state.next_state = "NONE"
+
+                # Handle specific state transitions
+                if (
+                    st.session_state.current_state == "reflection_reviewer" and
+                    st.session_state.next_state == "additional_reflection_instructions"
+                ):
+                    st.session_state.draft = state.values.get("critique", "")
+
+                if st.session_state.next_state == "generate_citations":
+                    st.session_state.references = state.values.get("references", "").split('\n')
+
+                if st.session_state.next_state in [END, "NONE"]:
+                    self.save_as()
+
+                # Generate atlas message
+                st.session_state.atlas_message = self.atlas_message(st.session_state.next_state)
+
+            # Clear the instruction input
+            st.session_state.instruction_input = ""
+
+            # Rerun the UI to reflect updates
+            st.experimental_rerun()
+
+        except Exception as e:
+            logger.error(f"Error updating instruction: {e}")
+            st.error(f"Error updating instruction: {e}")
+
 
 def run():
     working_dir = os.environ.get("KIROKU_PROJECT_DIRECTORY", os.getcwd())
-    # need this to allow images to be in a different directory
-    gr.set_static_paths(paths=[working_dir + '/images'])
     kiroku = KirokuUI(working_dir)
     kiroku.create_ui()
-    kiroku.launch_ui()
 
 if __name__ == "__main__":
     n_errors = 0
