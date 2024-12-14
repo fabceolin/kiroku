@@ -87,6 +87,7 @@ class SuggestTitle(State):
             ]
         response = self.model.invoke(messages)
         messages.append(response)
+
         return {
             "state": self.name,
             "title": response.content,

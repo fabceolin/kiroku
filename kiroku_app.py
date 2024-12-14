@@ -92,8 +92,7 @@ class DocumentWriter:
         :param name: name of the node.
         :return: True if we keep nodes, False otherwise
         '''
-        if (
-                name in ["suggest_title", "suggest_title_review"] and
+        if (name in ["suggest_title", "suggest_title_review"] and
                 not self.suggest_title):
             return False
         if name in ["generate_references", "generate_citations"] and not self.generate_citations:
@@ -229,6 +228,7 @@ class DocumentWriter:
         config = { "configurable": config }
         config["configurable"]["thread_id"] = self.get_thread_id()
         response = self.graph.invoke(state, config)
+        # Add this line where you want to break
         self.state = response
         draft = response.get("draft", "").strip()
         # we have to do this because the LLM sometimes decide to add
@@ -339,6 +339,11 @@ class KirokuUI:
         '''
         try:
             # Save uploaded file to working directory
+             # Check if already initialized
+            if st.session_state.kiroku_initialized:
+                st.warning("Configuration already loaded. No need to reinitialize.")
+                return
+
             filepath = os.path.join(self.working_dir, uploaded_file.name)
             with open(filepath, "wb") as f:
                 f.write(uploaded_file.getbuffer())
@@ -386,22 +391,24 @@ class KirokuUI:
         Performs the initial step of the document generation.
         '''
         try:
-            # Ensure messages key exists in state_values
             st.session_state.state_values.setdefault("messages", [])
 
-            # Invoke the writer with the initial state
             with st.spinner('Initializing document generation...'):
                 draft = st.session_state.writer.invoke(st.session_state.state_values, {})
-                st.session_state.draft = draft
+
+                # Get and store the new state
                 state = st.session_state.writer.get_state()
+                st.session_state.state_values = state.values  # Add this line
+
+                st.session_state.draft = draft
                 st.session_state.current_state = state.values.get("state", "")
+
                 try:
                     st.session_state.next_state = state.next[0]
                 except (IndexError, AttributeError):
                     st.session_state.next_state = "NONE"
 
-            # Generate atlas message
-            st.session_state.atlas_message = self.atlas_message(st.session_state.next_state)
+                st.session_state.atlas_message = self.atlas_message(st.session_state.next_state)
 
         except Exception as e:
             logger.error(f"Error in initial step: {e}")
@@ -559,24 +566,25 @@ class KirokuUI:
             if st.session_state.atlas_message:
                 st.markdown(f"**System Message:** {st.session_state.atlas_message}")
 
+            # Only show input if we're in a state that accepts instructions
+            if st.session_state.next_state not in ["generate_citations", "NONE", "END"]:
             # Input for instructions
-            instruction = st.text_input(
-                "Instruction",
-                placeholder="Enter your instruction here...",
-                key="instruction_input",
-                value=st.session_state.instruction_input_value
-            )
+                instruction = st.text_input(
+                    "Instruction",
+                    placeholder="Enter your instruction here...",
+                    key="instruction_input",
+                    value=st.session_state.instruction_input_value
+                )
 
-            # Submit Instruction Button
+            # Submit Button
             if st.button("Submit Instruction"):
-                if instruction.strip() == "" and st.session_state.next_state not in ["generate_citations", "NONE", "END"]:
+                if instruction.strip() == "":
                     st.warning("Please enter a valid instruction.")
                 else:
+                    # Update instruction and clear input
                     self.update_instruction(instruction)
-                    # Clear the input field by resetting the value in session_state
                     st.session_state.instruction_input_value = ''
-                    # Rerun the UI to update the input field
-                    st.experimental_rerun()
+                    # st.experimental_rerun()
 
             # Save button functionality
             if st.button("Save"):
@@ -587,7 +595,6 @@ class KirokuUI:
             if not st.session_state.kiroku_initialized:
                 st.warning("Please upload the YAML configuration in the 'Initial Instructions' tab.")
                 return
-
             if st.session_state.generate_citations and st.session_state.references:
                 st.subheader("Select References to Keep")
                 # Use multiselect for better performance and usability
@@ -598,24 +605,26 @@ class KirokuUI:
                 )
 
     def update_instruction(self, instruction):
-        '''
-        Handles the instruction submission.
-        '''
         try:
-            # Update instruction in session state
             st.session_state.instruction = instruction
 
+            import pudb; pudb.set_trace()
+
             with st.spinner('Processing...'):
-                # Invoke the writer's update method
+                # Invoke the writer
                 if instruction.strip() != "":
-                    # Non-empty instruction: proceed as normal
-                    draft = st.session_state.writer.invoke(st.session_state.state_values, {"instruction": instruction})
+                    draft = st.session_state.writer.invoke(
+                        st.session_state.state_values,
+                        {"configurable": {"instruction": instruction, "thread_id": 1}}
+                    )
                 else:
-                    # Empty instruction: proceed to next state without adding new instructions
                     draft = st.session_state.writer.invoke(st.session_state.state_values, {})
 
-                st.session_state.draft = draft
+                # Update session state with new state
                 state = st.session_state.writer.get_state()
+                st.session_state.state_values = state.values  # Add this line
+
+                st.session_state.draft = draft
                 st.session_state.current_state = state.values.get("state", "")
 
                 try:
@@ -623,7 +632,7 @@ class KirokuUI:
                 except (IndexError, AttributeError):
                     st.session_state.next_state = "NONE"
 
-                # Handle specific state transitions
+                # Handle specific states
                 if (
                     st.session_state.current_state == "reflection_reviewer" and
                     st.session_state.next_state == "additional_reflection_instructions"
@@ -636,17 +645,12 @@ class KirokuUI:
                 if st.session_state.next_state in ["NONE", "END"]:
                     self.save_as()
 
-                # Generate atlas message
                 st.session_state.atlas_message = self.atlas_message(st.session_state.next_state)
-
-            # No need to clear the instruction input here; it's handled in create_ui()
-
-            # Rerun the UI to reflect updates
-            st.rerun()
 
         except Exception as e:
             logger.error(f"Error updating instruction: {e}")
             st.error(f"Error updating instruction: {e}")
+
 
 def run():
     working_dir = os.environ.get("KIROKU_PROJECT_DIRECTORY", os.getcwd())
